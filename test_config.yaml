@@ -1,0 +1,27 @@
+CU_QUERY_TIME: 10
+CU_PERIOD: 5
+COLUMNS:
+- timestamp
+- component_id
+- read_bytes.sum
+- write_bytes.sum
+DELTAS:
+- lustre
+PATH: /LDMS_data/SOS/sos1/lustre_client/
+REC_PATH: /LDMS_data/SOS/py-sim-serv
+# file_canary_queue_path: /xch/local/canary_queue
+# use_canary: /LDMS_data/SOS/canary
+SUM_SOURCES:
+  lustre:
+  - read_bytes.sum
+  - write_bytes.sum
+address: localhost
+port: 9999
+production: true
+zero_current_utilization: true
+FACTORS:
+  lustre: 0.0004
+  # lustre: 0
+  timelimit: 0.016666666666666666
+  user: 1
+

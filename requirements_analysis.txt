@@ -1,0 +1,7 @@
+numpy
+pandas
+matplotlib
+sortedcontainers
+seaborn
+pyyaml
+scipy

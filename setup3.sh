@@ -1,6 +1,7 @@
 #!/bin/bash
+
 TOP=/source/ovis
-SOS=/source/sos
+SOS=/source/sos4.3.4
 
 if [ -z "$HOSTINDEX" ] ; then
 
@@ -8,7 +9,7 @@ if [ -z "$HOSTINDEX" ] ; then
   export LDMSD_PLUGIN_LIBPATH=$TOP/lib/ovis-ldms/ 
   export ZAP_LIBPATH=$TOP/lib/ovis-ldms/ 
   export PATH=$SOS/bin:$TOP/sbin:$TOP/bin:$PATH 
-  export PYTHONPATH=$TOP/lib/python2.7/site-packages/:$SOS/lib/python2.7/site-packages/:$PYTHONPATH
+  export PYTHONPATH=$SOS/lib/python3.6/site-packages/:$PYTHONPATH
 
   export SAMPLE_INTERVAL=1000000
 

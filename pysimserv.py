@@ -1,11 +1,38 @@
+"""
+ Copyright (c) 2024 Alexander Goponenko. University of Central Florida.
+ 
+ Permission is hereby granted, free of charge, to any person obtaining
+ a copy of this software and associated documentation files (the
+ “Software”), to deal in the Software without restriction, including
+ without limitation the rights to use, copy, modify, merge, publish,
+ distribute, sublicense, and/or sell copies of the Software, and
+ to permit persons to whom the Software is furnished to do so,
+ subject to the following conditions:
+ 
+ The above copyright notice and this permission notice shall be
+ included in all copies or substantial portions of the Software.
+ 
+ THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND,
+ EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES
+ OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+ IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE
+ FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+ OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+"""
+
 #
 # NOTE: make sure that SOS library is in the path
 #
 from __future__ import division
-import os
 
-print(os.environ['LD_LIBRARY_PATH'])
+# import os
+#print(os.environ['LD_LIBRARY_PATH'])
+#if not os.environ['LD_LIBRARY_PATH']: 
+#  print('no LD_LIBRARY_PATH')
 
+import sys
+import math
 import time
 import SocketServer
 import json
@@ -15,41 +42,179 @@ import hashlib
 import numpy as np
 
 import Queue
-import threading
 
 from sosdb import Sos
 from numsos.DataSource import SosDataSource
 
+from sos_recorder import Recorder
+import table_log
+
+###################################################
+#
+# configuration switch
+#
+###################################################
+is_production = False
+
+###################################################
+#
 # "constants"
+#
+###################################################
 MAX = 1024 * 4 # maximum lenght of network message
-QUERY_LIMIT = 4096
+QUERY_LIMIT = 4096 # maximum number of rows to be returned by queries
 OVERFLOW = 1 + 0xffffffffffffffff # uint64 overflow value
-ZERO_TIME = np.datetime64('1970-01-01T00:00:00Z')
+ZERO_TIME = np.datetime64('1970-01-01T00:00:00Z') # used to convert date to int
+#DEFAULT_DT = 1 # default interval between samples in seconds
 
-# parameters to calculate for finished jobs
+###################################################
+#
+# parameters for processing of finished jobs
+#
+###################################################
 PROCESSING_DELAY = 20  # seconds
-N_TRIES = 10 # number of tries before giving up on a job
-DELTAS = set(("user",))
-PATH = '/LDMS_data/SOS/sos1/procstat/'
+N_TRIES = 3 # number of tries before giving up on a job
+DELTAS = ("user",)
+if is_production:
+  DELTAS = ("lustre",)
+PATH = '/LDMS_data/SOS/sos1/procstat/' # path to the LDMS records
+REC_PATH = "/LDMS_data/SOS/results" # path to the DB that keeps summaries of usage
+if is_production:
+  PATH = '/LDMS_data/SOS/sos1/lustre2_client/'
+  REC_PATH = "/LDMS_data/SOS/results"
+# set of metrics that should be calculated
+PARAMS = list(DELTAS)
+PARAMS.append("timelimit")
+# decay constants (alphas) for the metrics
+DECAY = {
+  "timelimit" : 0.2, 
+  "user" : 0.2,
+  "lustre" : 0.2
+}
+# how many sigmas shall we add to averages when predicting usage
+K_SIGMA = {
+  "timelimit" : 3, 
+  "lustre" : 0,
+  "user" : 1
+}
 
-# parameters to calculate current utilization
+# functions to calculate data for each deltas
+def simple_array(data_source_result, val_name):
+  return data_source_result.array(val_name)
+
+SUM_SOURCES = {
+    "lustre" : ["client.read_bytes#llite.testfs",
+                "client.write_bytes#llite.testfs"]
+  }
+def sum_array(data_source_result, val_name):
+  res = 0
+  for name in SUM_SOURCES[val_name]:
+    res = data_source_result.array(name) + res
+  return res
+
+DELTAS_DATA_GETTERS = {
+  'user' : simple_array,
+  'lustre' : sum_array
+  }
+
+###################################################
+#
+# columns to read from db
+#
+###################################################
+COLUMNS = ["timestamp", "component_id", 'user']
+if is_production:
+  COLUMNS = ["timestamp", 
+	    "component_id", 
+	    "client.read_bytes#llite.testfs",
+	    "client.write_bytes#llite.testfs"]
+
+
+###################################################
+#
+# additional parameters for calculating current utilization
+#
+###################################################
 CU_QUERY_TIME = 10 # seconds
 CU_PERIOD = CU_QUERY_TIME/2 # 1/(frequency of updates) (seconds)
 
-# init globals
-COLUMNS = ["timestamp", "component_id"]
-COLUMNS.extend(DELTAS)
 
-print "COLUMNS: ", COLUMNS
+###################################################
+#
+# communication protocol related parameters
+#
+###################################################
+# names for the metrics that should be used in communications 
+TRANSLATE = {
+  "timelimit" : "time_limit", 
+  "user" : "lustre"
+}
+# the metrics should be multiplied by the following values
+FACTORS = {
+  "timelimit" : 1.0/60.0, 
+  "user" : 1,
+  "lustre" : 10000.0/14000000.0
+}
+
+
+###################################################
+#
+# parameters for saving to tables
+#
+###################################################
+
+doSaveTables = True
+
+if doSaveTables:
+  prefixSaveTables = "/xch/results/" if is_production else ""
+  gJobsTable = table_log.TableLog(prefixSaveTables+"jobs_results_table.csv")
+  titles = ["job_id", "variety_id", "start_time", "end_time", "dt"]
+  for val_name in DELTAS:
+    titles.extend([val_name+"_avg", val_name+"_var"])
+  gJobsTable.log(titles)
+  gSummaryTable = table_log.TableLog(prefixSaveTables+"summary_results_table.csv")
+  titles = ["variety_id", "time", "param", "avg", "var"]
+  gSummaryTable.log(titles)
+  # current utilization
+  gCUTable = table_log.TableLog(prefixSaveTables+"current_utilization_table.csv")
+  titles = ["time"]
+  for val_name in DELTAS:
+    titles.extend([val_name])
+  gCUTable.log(titles)
+
+
+###################################################
+#
+# globals
+#
+###################################################
+
+
 
 gMessageQueue = Queue.Queue(0)
 
 gCU_lock = threading.Lock()
-gCU_avg = {}
+gCU_avg = dict.fromkeys(DELTAS, 0.0)
 
+gRecorder = Recorder(REC_PATH)
+
+logging.basicConfig()
+TCPlog = logging.getLogger("TCP");
+TCPlog.setLevel(logging.INFO)
+
+
+###################################################
+#
+# the rest
+#
+###################################################
 
 def DT64toTS(dt64):
-  return (dt64 - ZERO_TIME) / np.timedelta64(1, 's')
+  return (dt64 - ZERO_TIME) / np.timedelta64(1, 's') if dt64.size else dt64
+
+
+def format_value(param, val):
+    return str(int(math.ceil(val * FACTORS[param])))
 
 
 class State:
@@ -79,21 +244,25 @@ class DeltaParameter:
   "timestamp" which methods require must be a number, not a datatime64 or such 
   """
   
-  def __init__(self):
+  def __init__(self, log=None):
     self.tot_avg = 0
     self.tot_var = 0
-    
+    if log: 
+      self.log = log
+    else:
+      self.log = logging.getLogger("DeltaParameter")
+      self.log.setLevel(logging.DEBUG)
     
   def finish_node(self):  
     if self.cur_time == self.node_init_time:
-      logging.warn("start time and end time are equal for a node")
+      self.log.warn("start time and end time are equal for a node")
       return 
     node_time = (self.cur_time - self.node_init_time) #/ np.timedelta64(1, 's')
     node_avg = (self.cur_val - self.node_init_val + self.node_rollover) / node_time
     node_var = self.node_square_total/node_time - node_avg*node_avg
     self.tot_avg += node_avg
     self.tot_var += node_var
-    logging.debug("finish node; node_time: %f, node avg: %f, node_square_total: %f, node_var: %f",
+    self.log.debug("finish node; node_time: %f, node avg: %f, node_square_total: %f, node_var: %f",
                   node_time, node_avg, self.node_square_total, node_var)
   
   
@@ -109,25 +278,29 @@ class DeltaParameter:
     self.cur_time = timestamp
     self.cur_val = value
     self.node_rollover = 0
-    logging.debug("init node; value: %f, time: %s", value, str(timestamp))
+    self.log.debug("init node; value: %f, time: %s", value, str(timestamp))
   
   
   def same_node(self, timestamp, value):
+    self.log.debug("same_node; value: %f, timestamp: %s, ", value, str(timestamp))
     delta_value = value - self.cur_val
     delta_time = (timestamp - self.cur_time) #/ np.timedelta64(1, 's')
     # in case the value roll over
     if delta_value < 0 :
-      logging.info("!!!!!!!!!!!!!!!!!!!!! -- value rollover -- !!!!!!!!!!!!!!!!!")
+      self.log.info("!!!!!!!!!!!!!!!!!!!!! -- value rollover -- !!!!!!!!!!!!!!!!!")
       delta_value += OVERFLOW
       self.node_rollover += OVERFLOW
     if delta_time < 0 :
-      logging.error("timestamp rollover - should not happen")
-    self.node_square_total += delta_value * delta_value / delta_time
+      self.log.error("timestamp rollover - should not happen")
     self.cur_time = timestamp
     self.cur_val = value
-    logging.debug("same_node; value: %f, timestamp: %s, ", value, str(timestamp))
-    logging.debug("delta_value: %f, delta_time: %f, square: %f",
-                  delta_value, delta_time, delta_value * delta_value / delta_time)
+    if delta_time > 0:
+      square = delta_value * delta_value / delta_time
+      self.node_square_total += square
+    else:
+      square = 0
+    self.log.debug("delta_value: %f, delta_time: %f, square: %f",
+                  delta_value, delta_time, square)
   
   
   def finish_all(self):
@@ -138,7 +311,7 @@ class DeltaParameter:
 
 
 
-def process_job(dataSource, message):
+def process_job(dataSource, message, log):
   """ 
   called by process_thread for each job 
   
@@ -153,35 +326,32 @@ def process_job(dataSource, message):
   The time requirement for the job is then max_time - min_time + 2*avg_dt
   because up to 2*avg_dt could have not been acounted for
   """
-  logging.info("Processing job_id: %i, variety_id: %s", message.job_id, message.variety_id)
+  log.info("Processing job_id: %i, variety_id: %s", message.job_id, message.variety_id)
   dataSource.select(COLUMNS,
              where=[['job_id', Sos.COND_EQ, message.job_id]],
-             order_by='comp_time_job')
+             order_by='job_comp_time')
   a = dataSource.get_results(limit=1)
   if not a:
-    logging.info("No records for the job")
-    return False
+    log.info("No records for the job")
+    return None
   
   total_records = 1
   total_components = 1
   cur_comp_id = a.array('component_id')[0]
-  #cur_user = a.array('user')[0]
   cur_deltas = {}
   for val_name in DELTAS:
-    cur_deltas[val_name] = a.array(val_name)[0]
+    cur_deltas[val_name] = DELTAS_DATA_GETTERS[val_name](a, val_name)[0]
   cur_time = a.array('timestamp')[0]
   cur_timestamp = DT64toTS(cur_time)
-  logging.debug("first time: "+ str(cur_time))
+  log.debug("first time: "+ str(cur_time))
   min_time = cur_timestamp
   max_time = cur_timestamp
   dt_sample = 0
   dt_total = 0
-  #user_param = DeltaParameter()
-  #user_param.init_node(cur_timestamp, cur_user)
   delta_params = {}
   delta_data = {}
   for val_name in DELTAS:
-    delta_params[val_name] = DeltaParameter()
+    delta_params[val_name] = DeltaParameter(log)
     delta_params[val_name].init_node(cur_timestamp, cur_deltas[val_name])
   while True:
     a = dataSource.get_results(limit=QUERY_LIMIT, reset = False)
@@ -191,24 +361,21 @@ def process_job(dataSource, message):
     
     timestamps = DT64toTS(a.array('timestamp'))
     comp_ids = a.array('component_id')
-    #user_data = a.array('user')
     for val_name in DELTAS:
-      delta_data[val_name] = a.array(val_name)
+      delta_data[val_name] = DELTAS_DATA_GETTERS[val_name](a, val_name)
     nrecords = len(timestamps)
     total_records += nrecords
-    logging.debug("total records so far: %d", total_records)
+    log.debug("total records so far: %d", total_records)
     for i in range(nrecords):
       
       if comp_ids[i] != cur_comp_id:
         # finish previous component
         max_time = max(max_time, cur_timestamp)
         total_components += 1
-        logging.debug("finished component #%d: %d", total_components, cur_comp_id)
+        log.debug("finished component #%d: %d", total_components, cur_comp_id)
         #  start new component id
         cur_comp_id = comp_ids[i]
         cur_timestamp = timestamps[i]
-        #cur_user = user_data[i]
-        #user_param.new_node(cur_timestamp, cur_user)
         for val_name in DELTAS:
           cur_deltas[val_name] = delta_data[val_name][i]
           delta_params[val_name].new_node(cur_timestamp, cur_deltas[val_name])
@@ -219,8 +386,6 @@ def process_job(dataSource, message):
         dt_total += new_timestamp - cur_timestamp
         dt_sample += 1
         cur_timestamp = new_timestamp
-        #cur_user = user_data[i]
-        #user_param.same_node(cur_timestamp, cur_user)
         for val_name in DELTAS:
           cur_deltas[val_name] = delta_data[val_name][i]
           delta_params[val_name].same_node(cur_timestamp, cur_deltas[val_name])
@@ -228,23 +393,50 @@ def process_job(dataSource, message):
       # end cycle
       break
   
-  logging.debug("finishing last component: %d", cur_comp_id)
+  log.debug("finishing last component: %d", cur_comp_id)
   max_time = max(max_time, cur_timestamp)
+  if dt_sample == 0 or dt_total == 0:
+    log.info("No useful records for the job")
+    return None
+  
   dt_avg = dt_total /  dt_sample
   delta_time = 2*dt_avg + (max_time - min_time) #/ np.timedelta64(1, 's')
-  #avg, var = user_param.finish_all()
   results = {}
   for val_name in DELTAS:
     results[val_name] = delta_params[val_name].finish_all()
-  avg, var = results['user']
-  logging.info("d_time: %f, avg: %f, var: %f", delta_time, avg, var)
-          
-  return True
+  a_value = next(iter(DELTAS))
+  avg, var = results[a_value]
+  log.info("d_time: %f, %s avg: %f, var: %f", delta_time, a_value, avg, var)
+  
+  if doSaveTables:
+    row = [message.job_id, message.variety_id, min_time, max_time, delta_time]
+    for val_name in DELTAS:
+      row.extend(results[val_name])
+    gJobsTable.log(row)
+  
+  return delta_time, results
 
+
+def normalizeRecord(record):
+  return record if record else (0.0, 0.0, 0.0, 0.0)
+
+def update_param(variety_id, param_name, avg, var):
+  alpha = DECAY[param_name]
+  pAvg, pVar, pCount, pSum = normalizeRecord(gRecorder.getRecord(variety_id, param_name))
+  nCount = 1 + (1-alpha) * pCount
+  nSum = avg + (1-alpha) * pSum
+  nAvg = nSum / nCount
+  nVar = (var + (avg-nAvg)**2 + (1-alpha)*pCount*(pVar +(pAvg-nAvg)**2))/nCount
+  if doSaveTables:
+    time_now = DT64toTS(np.datetime64('now'))
+    gSummaryTable.log([variety_id, time_now, param_name, nAvg, nVar])
+  gRecorder.saveRecord(variety_id, param_name, nAvg, nVar, nCount, nSum)
 
 def processing_thread():
   """ the job for the thread that monitores the queue and processes jobs  from it"""
-  logging.info("Job processing thread started")
+  log = logging.getLogger("job_util")
+  log.setLevel(logging.INFO)
+  log.info("Job processing thread started")
   src = SosDataSource()
   src.config(path=PATH)
   src.select(['timestamp'],
@@ -252,10 +444,10 @@ def processing_thread():
              order_by='time_comp_job')
   a = src.get_results()
   if a:
-    logging.info("Last minute results length: %s", len(a.array('timestamp')))
-    src.show(30)
+    log.info("Last minute results length: %s", len(a.array('timestamp')))
+    # src.show(30)
   else:
-    logging.info("No recent results")
+    log.info("No recent results")
   
   while True:
     if gMessageQueue.empty():
@@ -268,36 +460,38 @@ def processing_thread():
       # try processing 3 times
       for _ in range(N_TRIES):
         # process job data
-        if process_job(src, m):
+        result = process_job(src, m, log)
+        if result != None:
           break
         time.sleep(PROCESSING_DELAY)
-      
+      if not result:
+        log.error("Could not find any records for job %d, giving up", m.job_id)
+      else: 
+        dt, param_results = result
+        # process timelimit
+        update_param(m.variety_id, 'timelimit', dt, 0)
+        for param_name in param_results:
+          avg, var = param_results[param_name]
+          update_param(m.variety_id, param_name, avg, var)
 
-def calculate_current_utilization(dataSource):
+
+
+def calculate_current_utilization(dataSource, log):
   global gCU_avg
   global gCU_lock
-  a = dataSource.get_results(limit=1, reset = True)
-  if not a:
-    logging.info("No recent data for current utilization")
-    return False
+  dataSource.select(COLUMNS,
+             where = [['timestamp', Sos.COND_GE, time.time() - CU_QUERY_TIME]],
+             order_by='time_comp_job')
   
-  total_records = 1
-  total_components = 1
-  cur_comp_id = a.array('component_id')[0]
-  cur_time = a.array('timestamp')[0]
-  cur_timestamp = DT64toTS(cur_time)
-  start_timestamp = cur_timestamp
-  logging.debug("first time: "+ str(cur_time))
-  cur_deltas = {}
-  start_deltas = {}
-  avg_deltas = {}
   delta_data = {}
-  for val_name in DELTAS:
-    cur_deltas[val_name] = a.array(val_name)[0]
-    start_deltas[val_name] = cur_deltas[val_name]
-    avg_deltas[val_name] = 0
+  
+  total_records = 0
+  total_components = 0
+  mins = {}
+  maxs = {}
+  a = dataSource.get_results(limit=QUERY_LIMIT, reset = True)
+  
   while True:
-    a = dataSource.get_results(limit=QUERY_LIMIT, reset = False)
     if not a:
       # end cycle 
       break
@@ -305,62 +499,69 @@ def calculate_current_utilization(dataSource):
     timestamps = DT64toTS(a.array('timestamp'))
     comp_ids = a.array('component_id')
     for val_name in DELTAS:
-      delta_data[val_name] = a.array(val_name)
+      delta_data[val_name] = DELTAS_DATA_GETTERS[val_name](a, val_name)
     nrecords = len(timestamps)
     total_records += nrecords
-    logging.debug("total records so far: %d", total_records)
+    log.debug("total records so far: %d", total_records)
     for i in range(nrecords):
-      if comp_ids[i] != cur_comp_id:
-        # finish previous component
-        dt = cur_timestamp - start_timestamp
-        if dt > 0:
-          for val_name in DELTAS:
-            #TODO: take care of rollover
-            dv = cur_deltas[val_name] - start_deltas [val_name]
-            if dv < 0:
-              dv += OVERFLOW
-            avg_deltas[val_name] += dv / dt
+      cur_comp_id = comp_ids[i]
+      # prepare the record
+      record = {"timestamp" : timestamps[i]}
+      for val_name in DELTAS:
+        record[val_name] = delta_data[val_name][i]
+      # if the first row for this component, add it to mins
+      if cur_comp_id not in mins:
         total_components += 1
-        logging.debug("finished component #%d: %d", total_components, cur_comp_id)
-        #  start new component id
-        cur_comp_id = comp_ids[i]
-        cur_timestamp = timestamps[i]
-        start_timestamp = cur_timestamp
-        for val_name in DELTAS:
-          cur_deltas[val_name] = delta_data[val_name][i]
-          start_deltas[val_name] = cur_deltas[val_name]
-      else:
-        # process one more record for current component id
-        cur_timestamp = timestamps[i]
-        for val_name in DELTAS:
-          cur_deltas[val_name] = delta_data[val_name][i]
+        mins[cur_comp_id] = record
+      # update maxs
+      maxs[cur_comp_id] = record
     if nrecords < QUERY_LIMIT:
       # end cycle
       break
+    
+    a = dataSource.get_results(limit=QUERY_LIMIT, reset = False)
   
-  dt = cur_timestamp - start_timestamp
-  if dt > 0:
-    for val_name in DELTAS:
-      #TODO: take care of rollover
-      avg_deltas[val_name] += (cur_deltas[val_name] - start_deltas [val_name]) / dt
-  total_components += 1
-  logging.debug("finishing last component: %d", cur_comp_id)
-  avg = avg_deltas['user']
-  logging.info("avg: %f", avg)
+  if  total_records == 0:
+    log.info("No recent data for current utilization")
+    return False
+  
+  #now process each component
+  total_deltas = {}
+  for val_name in DELTAS:
+    total_deltas[val_name] = 0
+  for comp_id in mins:
+    minrow = mins[comp_id]
+    maxrow = maxs[comp_id]
+    dt = maxrow["timestamp"] - minrow["timestamp"]
+    if dt > 0:
+      for val_name in DELTAS:
+        #TODO: take care of rollover
+        total_deltas[val_name] += (maxrow[val_name] - minrow[val_name]) / dt
+  a_value = next(iter(DELTAS))
+  cu = total_deltas[a_value]
+  log.info("%s cu: %f from %d records of %d components",
+            a_value, cu, total_records, total_components)
   # save results
   with gCU_lock:
-    gCU_avg = avg_deltas
+    gCU_avg = total_deltas
+  
+  if doSaveTables:
+    time_now = DT64toTS(np.datetime64('now'))
+    row = [time_now]
+    for val_name in DELTAS:
+      row.append(total_deltas[val_name])
+    gCUTable.log(row)
 
 
 def current_utilization_thread():
-  logging.info("Current utilization thread started")
+  log = logging.getLogger("curr_util")
+  log.setLevel(logging.INFO)
+  log.info("Current utilization thread started")
   dataSource = SosDataSource()
   dataSource.config(path=PATH)
-  dataSource.select(COLUMNS,
-             where = [['timestamp', Sos.COND_GE, time.time() - CU_QUERY_TIME]],
-             order_by='comp_time_job')
+  
   while True:
-    calculate_current_utilization(dataSource)
+    calculate_current_utilization(dataSource, log)
     time.sleep(CU_PERIOD)
   
 
@@ -384,10 +585,10 @@ class MyTCPHandler(SocketServer.BaseRequestHandler):
     while 1:
       # self.request is the TCP socket connected to the client
       self.data = self.request.recv(MAX).strip()
-      logging.info("{} wrote: {}".format(self.client_address[0], self.data))
+      TCPlog.info("{} wrote: {}".format(self.client_address[0], self.data))
       
       if not self.data:
-        logging.info("closing connection")
+        TCPlog.info("closing connection")
         break
       
       resp = {"status":"error"}
@@ -432,25 +633,26 @@ class MyTCPHandler(SocketServer.BaseRequestHandler):
               resp["error"] = "wrond variety_id option"
                 
         elif req_type == "usage":
-          if "request" in req:
-            with gCU_lock:
-              cu_avg = gCU_avg
-            if req["request"] == "lustre":
-              resp["status"] = "OK"
-              # FIXME: change 'user' to 'lustre'
-              resp["response"] = str(cu_avg['user'])
-            elif req["request"].startswith("set "):
-              ## FIXME: temporary way to change usage
-              g_state.lustre_usage = int(req["request"][4,])
-              resp["status"] = "Got it"
-            else:
-              resp["status"] = "not implemented"
+          with gCU_lock:
+            cu_avg = gCU_avg
+          resp["status"] = "OK"
+          # TODO: change to new protocol
+          name = DELTAS[0]
+          resp["response"] = {"lustre" : format_value(name, cu_avg[name])}
               
         elif req_type == "job_utilization":
             if "variety_id" in req:
+              variety_id = req["variety_id"]
+              utilization = {}
+              for param in PARAMS:
+                record = gRecorder.getRecord(variety_id, param)
+                if record:
+                  avg, var = record[0:2]
+                  name = TRANSLATE.get(param, param) 
+                  val = avg + K_SIGMA[param] * math.sqrt(var)
+                  utilization[name] = format_value(param, val)
+              resp["response"] = utilization
               resp["status"] = "OK"
-              resp["lustre"] = "5000"
-              resp["time_limit"] = "5"
             else:
               resp["error"] = "variety_id not specified"
             
@@ -459,17 +661,17 @@ class MyTCPHandler(SocketServer.BaseRequestHandler):
             
       resp = json.dumps(resp)
       
-      logging.info("response: %s", resp)
+      TCPlog.info("response: %s", resp)
 
       resp += "\n"
       self.request.sendall(resp)
 
 
-def _start_server():
-    HOST, PORT = "localhost", 9999
+def _start_server(host, port):
     
-    # Create the server, binding to HOST on PORT
-    server = SocketServer.ThreadingTCPServer((HOST, PORT), MyTCPHandler, bind_and_activate=True)
+    
+    # Create the server, binding to host on port
+    server = SocketServer.ThreadingTCPServer((host, port), MyTCPHandler, bind_and_activate=True)
     server.daemon_threads = True;
     
     # Activate the server; this will keep running until you
@@ -481,6 +683,14 @@ logging.getLogger().setLevel(logging.DEBUG)
 
 if __name__ == "__main__":
     
+    host, port = "localhost", 9999
+    
+    # overwrite host and port is supplied in the command string
+    argv = sys.argv
+    if len(argv) > 1:
+      host = argv[1]
+      if len(argv) > 2:
+        port = int(argv[2])
     
     # start thread that processes completed jobs 
     th_cj = threading.Thread(target=processing_thread)
@@ -492,6 +702,6 @@ if __name__ == "__main__":
     th_cu.daemon = True
     th_cu.start()
     
-    _start_server()
+    _start_server(host, port)
     
    

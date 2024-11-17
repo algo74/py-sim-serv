@@ -1,0 +1,9 @@
+numpy
+# pyyaml ## pyyams>5.3.1 may result in AttributeError: cython_sources (see https://stackoverflow.com/questions/76708329/docker-compose-no-longer-building-image-attributeerror-cython-sources)
+pyyaml==5.3.1
+pandas
+#persist-queue
+#appdirs
+#packaging
+#ordered_set
+#dirq
