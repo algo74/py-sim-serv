@@ -3,6 +3,8 @@
 A "simple" implementation of "analytical services" components for Slurm-LDMS project.
 
 
+This repository contains source for the paper "Workload-Adaptive Scheduling for Efficient Use of Parallel File Systems in HPC Clusters" (presented at PBMS'2024). DOI: [TODO]()
+
 ## Overall design of Slurm-LDMS project
 
 ![Overall design](Overall_design.png "Overall design of Slurm-LDMS project")
