@@ -11,7 +11,7 @@ This repository contains source for the paper "Workload-Adaptive Scheduling for 
 
 Other components of the system:
 - Modified Slurm with required plugins (including instructions for installation and use):  
-  https://github.com/algo74/slurm
+  https://github.com/algo74/slurm/tree/workload-adaptive-paper-2024
 
 - LDMS:  
   https://github.com/ovis-hpc/ldms
